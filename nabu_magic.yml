@@ -106,15 +106,25 @@ micro_wake_word:
   vad:
   on_wake_word_detected:
     #- media_player.play_media: "${wakeup_sound_url}"
+    - microphone.mute:
+    # - logger.log: "wait for mic stop"
+    # - wait_until:
+    #     not:
+    #       microphone.is_capturing:
+    # - logger.log: "mic stopped"
+    - delay: 250ms
     - media_player.speaker.play_on_device_media_file:
         media_file: wakeup
         announcement: true
     - wait_until:
-        media_player.is_announcing:
+        speaker.is_playing:
+          id: onju_out
     - wait_until:
         not:
-          media_player.is_announcing:
+          speaker.is_playing:
+            id: onju_out
     - delay: 250ms
+    - microphone.unmute:
     - voice_assistant.start:
         wake_word: !lambda return wake_word;
 
@@ -235,22 +245,16 @@ media_player:
     #       id(i2s_mics).start();
     on_announcement:
       - logger.log: "On Announce"
-      #- microphone.mute:
-      - delay: 350ms
+      # - microphone.mute:
+      - delay: 250ms
       - microphone.stop_capture:
+      # - microphone.unmute:
     on_play:
       - logger.log: "On Play"
-      - microphone.mute:
-      #- microphone.stop_capture:
+      #- microphone.mute:
+      - microphone.stop_capture:
     on_pause:
       - logger.log: "On Pause"
-      - delay: 250ms
-      - microphone.mute:
-      #- microphone.stop_capture:
-      - delay: 550ms
-      - microphone.unmute:
-      #- microphone.capture:
-    on_idle:
       - delay: 250ms
       - microphone.mute:
       - microphone.stop_capture:
@@ -258,6 +262,17 @@ media_player:
       - delay: 550ms
       - microphone.unmute:
       - microphone.capture:
+      - micro_wake_word.start:
+    on_idle:
+      - logger.log: "On IDLE"
+      - delay: 250ms
+      - microphone.mute:
+      - microphone.stop_capture:
+      - micro_wake_word.stop:
+      - delay: 550ms
+      - microphone.unmute:
+      - microphone.capture:
+      - micro_wake_word.start:
 
 button:
   - platform: template
@@ -654,7 +669,6 @@ switch:
       - script.execute: turn_off_wake_word
   - platform: gpio
     id: dac_mute
-    # name: OnjuDacMute
     restore_mode: ALWAYS_OFF
     pin:
       number: GPIO21
