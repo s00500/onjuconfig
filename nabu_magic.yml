@@ -106,13 +106,6 @@ micro_wake_word:
   vad:
   on_wake_word_detected:
     #- media_player.play_media: "${wakeup_sound_url}"
-    - microphone.mute:
-    # - logger.log: "wait for mic stop"
-    # - wait_until:
-    #     not:
-    #       microphone.is_capturing:
-    # - logger.log: "mic stopped"
-    - delay: 250ms
     - media_player.speaker.play_on_device_media_file:
         media_file: wakeup
         announcement: true
@@ -123,8 +116,6 @@ micro_wake_word:
         not:
           speaker.is_playing:
             id: onju_out
-    - delay: 250ms
-    - microphone.unmute:
     - voice_assistant.start:
         wake_word: !lambda return wake_word;
 
@@ -219,39 +210,12 @@ media_player:
               }
             }
             old_volume = new_volume;
-    # on_announcement:
-    #   - logger.log: "On Announce"
-    #   - lambda: |-
-    #       id(i2s_mics).stop();
-    # on_play:
-    #   - logger.log: "On Play"
-    #   - lambda: |-
-    #       id(i2s_mics).stop();
-    # on_pause:
-    #   - logger.log: "On Pause"
-    #   #- delay: 250ms
-    #   - lambda: |-
-    #       id(i2s_mics).stop();
-    #   - delay: 550ms
-    #   - lambda: |-
-    #       id(i2s_mics).start();
-    # on_idle:
-    #   - logger.log: "On IDLE"
-    #   #- delay: 250ms
-    #   - lambda: |-
-    #       id(i2s_mics).stop();
-    #   - delay: 550ms
-    #   - lambda: |-
-    #       id(i2s_mics).start();
     on_announcement:
       - logger.log: "On Announce"
-      # - microphone.mute:
       - delay: 250ms
       - microphone.stop_capture:
-      # - microphone.unmute:
     on_play:
       - logger.log: "On Play"
-      #- microphone.mute:
       - microphone.stop_capture:
     on_pause:
       - logger.log: "On Pause"
@@ -259,7 +223,7 @@ media_player:
       - microphone.mute:
       - microphone.stop_capture:
       - micro_wake_word.stop:
-      - delay: 550ms
+      - delay: 250ms
       - microphone.unmute:
       - microphone.capture:
       - micro_wake_word.start:
@@ -269,7 +233,7 @@ media_player:
       - microphone.mute:
       - microphone.stop_capture:
       - micro_wake_word.stop:
-      - delay: 550ms
+      - delay: 250ms
       - microphone.unmute:
       - microphone.capture:
       - micro_wake_word.start:
