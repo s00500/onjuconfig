@@ -196,9 +196,10 @@ media_player:
       - id: wakeup
         file: beep.flac
       - id: error
-        file: error.flac
+        file: error24.flac
       # - id: timer_finished
       #   file: timer_finished.flac
+      # ffmpeg -i error.flac -af aresample=out_sample_fmt=s16:out_sample_rate=24000 error24.flac
     on_state:
       then:
         - lambda: |-
@@ -215,46 +216,25 @@ media_player:
       - delay: 250ms
       - microphone.stop_capture:
     on_play:
-      - logger.log: "On Play"
+      #- logger.log: "On Play"
+      - delay: 250ms
       - microphone.stop_capture:
     on_pause:
-      - logger.log: "On Pause"
-      - delay: 250ms
-      - microphone.mute:
+      #- logger.log: "On Pause"
       - microphone.stop_capture:
-      - micro_wake_word.stop:
-      - delay: 250ms
-      - microphone.unmute:
+      - wait_until:
+          not:
+            speaker.is_playing:
+              id: onju_out
       - microphone.capture:
-      - micro_wake_word.start:
     on_idle:
-      - logger.log: "On IDLE"
-      - delay: 250ms
-      - microphone.mute:
+      #- logger.log: "On IDLE"
       - microphone.stop_capture:
-      - micro_wake_word.stop:
-      - delay: 250ms
-      - microphone.unmute:
+      - wait_until:
+          not:
+            speaker.is_playing:
+              id: onju_out
       - microphone.capture:
-      - micro_wake_word.start:
-
-button:
-  - platform: template
-    name: Nabu 2 start mic
-    on_press:
-      - microphone.unmute:
-  - platform: template
-    name: Nabu 2 stop mic
-    on_press:
-      - microphone.mute:
-  - platform: template
-    name: Nabu 2 start wake
-    on_press:
-      - micro_wake_word.start:
-  - platform: template
-    name: Nabu 2 stop wake
-    on_press:
-      - micro_wake_word.stop:
 
 voice_assistant:
   id: va
