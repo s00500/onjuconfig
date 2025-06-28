@@ -105,6 +105,7 @@ micro_wake_word:
   stop_after_detection: false
   vad:
   on_wake_word_detected:
+    #- media_player.play_media: "${wakeup_sound_url}"
     - media_player.speaker.play_on_device_media_file:
         media_file: wakeup
         announcement: true
@@ -138,7 +139,7 @@ speaker:
   - platform: i2s_audio
     id: onju_out
     sample_rate: 48000
-    bits_per_sample: 32bit
+    #bits_per_sample: 24bit
     i2s_mode: primary
     i2s_dout_pin: GPIO12
     i2s_audio_id: i2s_output
@@ -189,7 +190,7 @@ media_player:
       num_channels: 2
     announcement_pipeline:
       speaker: announcement_spk_resampling_input
-      num_channels: 1
+      num_channels: 2
     files:
       - id: wakeup
         file: beep.flac
@@ -208,20 +209,55 @@ media_player:
               }
             }
             old_volume = new_volume;
+    # on_announcement:
+    #   - logger.log: "On Announce"
+    #   - lambda: |-
+    #       id(i2s_mics).stop();
+    # on_play:
+    #   - logger.log: "On Play"
+    #   - lambda: |-
+    #       id(i2s_mics).stop();
+    # on_pause:
+    #   - logger.log: "On Pause"
+    #   #- delay: 250ms
+    #   - lambda: |-
+    #       id(i2s_mics).stop();
+    #   - delay: 550ms
+    #   - lambda: |-
+    #       id(i2s_mics).start();
+    # on_idle:
+    #   - logger.log: "On IDLE"
+    #   #- delay: 250ms
+    #   - lambda: |-
+    #       id(i2s_mics).stop();
+    #   - delay: 550ms
+    #   - lambda: |-
+    #       id(i2s_mics).start();
     on_announcement:
-      - microphone.mute:
+      - logger.log: "On Announce"
+      #- microphone.mute:
+      - delay: 350ms
+      - microphone.stop_capture:
     on_play:
+      - logger.log: "On Play"
       - microphone.mute:
+      #- microphone.stop_capture:
     on_pause:
+      - logger.log: "On Pause"
       - delay: 250ms
       - microphone.mute:
-      - delay: 250ms
+      #- microphone.stop_capture:
+      - delay: 550ms
       - microphone.unmute:
+      #- microphone.capture:
     on_idle:
       - delay: 250ms
       - microphone.mute:
-      - delay: 250ms
+      - microphone.stop_capture:
+      - micro_wake_word.stop:
+      - delay: 550ms
       - microphone.unmute:
+      - microphone.capture:
 
 button:
   - platform: template
@@ -245,7 +281,7 @@ voice_assistant:
   id: va
   microphone:
     microphone: i2s_mics # onju_microphone
-    channels: 0
+    channels: 1
   media_player:
   use_wake_word: false
   on_listening:
