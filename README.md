@@ -14,7 +14,6 @@ substitutions:
   twinkle_probability: "1%"
   device_description: "Onju Voice Satellite"
   project_version: "3.0.0"
-  timer_finished_sound_url: "http://homeassistant.local:8123/local/beep/timer_finished.mp3"
   # micdebug_host: "192.168.0.x"   # only with the micdebug add-on
 
 packages:

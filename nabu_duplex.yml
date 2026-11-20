@@ -5,6 +5,8 @@
 # - Speaker needs i2s_comm_fmt: stand_msb on the duplex bus (with stand_i2s the amp reads TX one
 #   bit late and any volume below 100% becomes loud noise), and a 32 bit chain end to end.
 # - Touch thresholds are deltas to the hardware benchmark. Calibrate with touch_setup_mode: "true".
+# - Timers ring like on the Voice PE: built-in sound repeated as an announcement over ducked media until
+#   stopped by saying "stop", the wake word or the center pad (max 15 min). The top LEDs count down.
 
 substitutions:
   mic_channel: "1" # 0 = left slot, 1 = right slot
@@ -18,6 +20,7 @@ substitutions:
   touch_thresh_left: "8000"
   touch_thresh_center: "12000"
   touch_thresh_right: "7000"
+  timer_finished_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/e2fc10e81071d1f2b7e7674af730c15b8819123f/sounds/timer_finished.flac
 
 esphome:
   name: "${name}"
@@ -29,6 +32,7 @@ esphome:
     version: "${project_version}"
   on_boot:
     then:
+      - micro_wake_word.disable_model: stop
       - light.turn_on:
           id: top_led
           effect: slow_pulse
@@ -188,6 +192,8 @@ media_player:
         file: beep.flac
       - id: error
         file: error24.flac
+      - id: timer_finished
+        file: ${timer_finished_sound_file}
     on_volume:
       - script.execute: show_volume
 
@@ -195,26 +201,38 @@ micro_wake_word:
   id: mww
   models:
     - model: okay_nabu
+      id: okay_nabu
+    # Only enabled while a timer rings, so "stop" works without the wake word
+    - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
+      id: stop
+      internal: true
   microphone: mic_16k
   stop_after_detection: false
   vad:
   on_wake_word_detected:
-    - mixer_speaker.apply_ducking:
-        id: media_spk_mixer_input
-        decibel_reduction: ${duck_db}
-        duration: 0.0s
-    - media_player.speaker.play_on_device_media_file:
-        media_file: wakeup
-        announcement: true
-    - wait_until:
+    - if:
         condition:
-          media_player.is_announcing: nabu
-        timeout: 500ms
-    - wait_until:
-        not:
-          media_player.is_announcing: nabu
-    - voice_assistant.start:
-        wake_word: !lambda return wake_word;
+          switch.is_on: timer_ringing
+        then:
+          # "stop" or the wake word while a timer rings only silences it
+          - switch.turn_off: timer_ringing
+        else:
+          - mixer_speaker.apply_ducking:
+              id: media_spk_mixer_input
+              decibel_reduction: ${duck_db}
+              duration: 0.0s
+          - media_player.speaker.play_on_device_media_file:
+              media_file: wakeup
+              announcement: true
+          - wait_until:
+              condition:
+                media_player.is_announcing: nabu
+              timeout: 500ms
+          - wait_until:
+              not:
+                media_player.is_announcing: nabu
+          - voice_assistant.start:
+              wake_word: !lambda return wake_word;
 
 voice_assistant:
   id: va
@@ -252,10 +270,14 @@ voice_assistant:
     - wait_until:
         not:
           media_player.is_announcing: nabu
-    - mixer_speaker.apply_ducking:
-        id: media_spk_mixer_input
-        decibel_reduction: 0
-        duration: 1.0s
+    - if:
+        condition:
+          switch.is_off: timer_ringing
+        then:
+          - mixer_speaker.apply_ducking:
+              id: media_spk_mixer_input
+              decibel_reduction: 0
+              duration: 1.0s
     - script.execute: reset_led
     - if:
         condition:
@@ -289,19 +311,11 @@ voice_assistant:
     - delay: 1s
     - script.execute: reset_led
   on_timer_started:
-    - light.turn_on:
-        id: top_led
-        effect: random_twinkle
-  on_timer_finished:
-    - media_player.play_media: "${timer_finished_sound_url}"
-    - light.turn_on:
-        id: top_led
-        blue: 0%
-        red: 100%
-        green: 80%
-        effect: slow_pulse
-    - delay: 5s
     - script.execute: reset_led
+  on_timer_cancelled:
+    - script.execute: reset_led
+  on_timer_finished:
+    - switch.turn_on: timer_ringing
 
 # ---------------------------------------------------------------- touch
 
@@ -377,6 +391,12 @@ binary_sensor:
     internal: true
     pin: GPIO3
     threshold: ${touch_thresh_center}
+    on_press:
+      - if:
+          condition:
+            switch.is_on: timer_ringing
+          then:
+            - switch.turn_off: timer_ringing
 
   - platform: gpio
     id: mute_switch
@@ -437,6 +457,25 @@ light:
           intensity: 35%
       - addressable_random_twinkle:
           name: random_twinkle
+      # Time left of the timer that ends first, as a bar over the 4 top LEDs
+      - addressable_lambda:
+          name: timer_tick
+          update_interval: 250ms
+          lambda: |-
+            const voice_assistant::Timer *t = nullptr;
+            for (const auto &timer : id(va).get_timers()) {
+              if (timer.is_active && (t == nullptr || timer.seconds_left < t->seconds_left))
+                t = &timer;
+            }
+            if (t == nullptr) {
+              it.all() = Color::BLACK;
+              return;
+            }
+            const float ratio = it.size() * (float) t->seconds_left / (float) std::max<uint32_t>(t->total_seconds, 1);
+            for (int i = 0; i < it.size(); i++) {
+              const float level = std::clamp(ratio - i, 0.0f, 1.0f);
+              it[i] = current_color * (uint8_t) (255 * std::max(level, 0.08f));
+            }
       - addressable_lambda:
           name: show_volume
           update_interval: 50ms
@@ -476,6 +515,22 @@ script:
     then:
       - if:
           condition:
+            switch.is_on: timer_ringing
+          then:
+            - light.turn_on:
+                id: top_led
+                red: 100%
+                green: 50%
+                blue: 0%
+                brightness: 100%
+                effect: pulse
+          else:
+            - script.execute: reset_led_idle
+
+  - id: reset_led_idle
+    then:
+      - if:
+          condition:
             - lambda: return id(notification);
           then:
             - light.turn_on:
@@ -501,6 +556,20 @@ script:
                       effect: listening_ww
                 else:
                   - light.turn_off: top_led
+      - if:
+          condition:
+            lambda: |-
+              for (const auto &timer : id(va).get_timers())
+                if (timer.is_active) return true;
+              return false;
+          then:
+            - light.turn_on:
+                id: top_led
+                red: 100%
+                green: 50%
+                blue: 0%
+                brightness: 60%
+                effect: timer_tick
 
   - id: show_volume
     mode: restart
@@ -546,6 +615,13 @@ script:
       - micro_wake_word.stop
       - script.execute: reset_led
 
+  # Stops a forgotten timer after 15 minutes
+  - id: timer_ring_timeout
+    mode: restart
+    then:
+      - delay: 15min
+      - switch.turn_off: timer_ringing
+
 switch:
   - platform: template
     name: Use Wake Word
@@ -556,6 +632,50 @@ switch:
       - script.execute: turn_on_wake_word
     on_turn_off:
       - script.execute: turn_off_wake_word
+  # On while a finished timer rings
+  - platform: template
+    id: timer_ringing
+    optimistic: true
+    internal: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - mixer_speaker.apply_ducking:
+          id: media_spk_mixer_input
+          decibel_reduction: ${duck_db}
+          duration: 0.0s
+      - micro_wake_word.enable_model: stop
+      - media_player.repeat_one:
+          id: nabu
+          announcement: true
+      - lambda: id(nabu).set_playlist_delay_ms(speaker::AudioPipelineType::ANNOUNCEMENT, 500);
+      - media_player.speaker.play_on_device_media_file:
+          media_file: timer_finished
+          announcement: true
+      - script.execute: reset_led
+      - script.execute: timer_ring_timeout
+    on_turn_off:
+      - script.stop: timer_ring_timeout
+      - micro_wake_word.disable_model: stop
+      - media_player.repeat_off:
+          id: nabu
+          announcement: true
+      - lambda: id(nabu).set_playlist_delay_ms(speaker::AudioPipelineType::ANNOUNCEMENT, 0);
+      - if:
+          condition:
+            media_player.is_announcing: nabu
+          then:
+            - media_player.stop:
+                id: nabu
+                announcement: true
+      - if:
+          condition:
+            not: voice_assistant.is_running
+          then:
+            - mixer_speaker.apply_ducking:
+                id: media_spk_mixer_input
+                decibel_reduction: 0
+                duration: 1.0s
+      - script.execute: reset_led
   - platform: gpio
     id: dac_mute
     restore_mode: ALWAYS_OFF
