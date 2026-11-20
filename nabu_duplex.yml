@@ -1,3 +1,24 @@
+# Onju Voice package for ESPHome >= 2026.11.
+#
+# - One i2s bus with full_duplex: true at 48 kHz / 32 bit; a resampler microphone feeds
+#   micro_wake_word and voice_assistant at 16 kHz / 16 bit. Wake word keeps running during playback.
+# - Speaker needs i2s_comm_fmt: stand_msb on the duplex bus (with stand_i2s the amp reads TX one
+#   bit late and any volume below 100% becomes loud noise), and a 32 bit chain end to end.
+# - Touch thresholds are deltas to the hardware benchmark. Calibrate with touch_setup_mode: "true".
+
+substitutions:
+  mic_channel: "1" # 0 = left slot, 1 = right slot
+  mic_gain: "8" # integer 1..64, applied at 32 bit before conversion to 16 bit (8: speech peaks ~ -11 dBFS on nabu 2)
+  noise_suppression_level: "0" # 0..4, done by Home Assistant
+  auto_gain: "0dBFS" # 0..31 dBFS, done by Home Assistant
+  volume_multiplier: "1.0" # done by Home Assistant
+  duck_db: "20"
+  touch_setup_mode: "false"
+  # nabu 2, 2026-11-19: idle noise up to ~3k, touched +18..22k (left), +11..21k (right), +30..37k (center)
+  touch_thresh_left: "8000"
+  touch_thresh_center: "12000"
+  touch_thresh_right: "7000"
+
 esphome:
   name: "${name}"
   friendly_name: "${friendly_name}"
@@ -6,9 +27,6 @@ esphome:
   project:
     name: tetele.onju_voice_satellite
     version: "${project_version}"
-  platformio_options:
-    board_build.flash_mode: dio
-    board_build.arduino.memory_type: qio_opi
   on_boot:
     then:
       - light.turn_on:
@@ -48,18 +66,14 @@ esp32:
       CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
       CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
-      CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST: "y"
-      CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY: "y"
       CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
-      CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y" # TLS1.3 support isn't enabled by default in IDF 5.1.5
+
 psram:
   mode: octal
   speed: 80MHz
 
-# Enable logging
 logger:
 
-# Allow OTA updates
 ota:
   platform: esphome
   password: ${ota_password}
@@ -72,17 +86,17 @@ wifi:
 api:
   encryption:
     key: ${api_key}
-  services:
-    - service: start_va
+  actions:
+    - action: start_va
       then:
         - voice_assistant.start
-    - service: stop_va
+    - action: stop_va
       then:
         - voice_assistant.stop
-    - service: notification_on
+    - action: notification_on
       then:
         - script.execute: turn_on_notification
-    - service: notification_clear
+    - action: notification_clear
       then:
         - script.execute: clear_notification
 
@@ -90,67 +104,59 @@ globals:
   - id: notification
     type: bool
     restore_value: false
-  - id: volume_touched
-    type: bool
-    restore_value: no
-    initial_value: "false"
 
-micro_wake_word:
-  models:
-    - model: https://github.com/kahrendt/microWakeWord/releases/download/v2.1_models/okay_nabu.json
-  microphone:
-    microphone: i2s_mics # mww_microphone
-    channels: 1
-    gain_factor: 4
-  stop_after_detection: false
-  vad:
-  on_wake_word_detected:
-    #- media_player.play_media: "${wakeup_sound_url}"
-    - media_player.speaker.play_on_device_media_file:
-        media_file: wakeup
-        announcement: true
-    - wait_until:
-        speaker.is_playing:
-          id: onju_out
-    - wait_until:
-        not:
-          speaker.is_playing:
-            id: onju_out
-    - voice_assistant.start:
-        wake_word: !lambda return wake_word;
+# ---------------------------------------------------------------- audio
 
 i2s_audio:
-  - id: i2s_output
-    i2s_lrclk_pin:
-      number: GPIO13
-      allow_other_uses: true
-    i2s_bclk_pin:
-      number: GPIO18
-      allow_other_uses: true
+  - id: i2s_bus
+    i2s_lrclk_pin: GPIO13
+    i2s_bclk_pin: GPIO18
+    full_duplex: true
 
-  - id: i2s_input
-    i2s_lrclk_pin:
-      number: GPIO13
-      allow_other_uses: true
-    i2s_bclk_pin:
-      number: GPIO18
-      allow_other_uses: true
+microphone:
+  # Both onju mics, raw, at the bus rate. Left and right slot = the two mics.
+  - platform: i2s_audio
+    id: i2s_mics
+    i2s_audio_id: i2s_bus
+    i2s_din_pin: GPIO17
+    adc_type: external
+    pdm: false
+    sample_rate: 48000
+    bits_per_sample: 32bit
+    channel: stereo
+    i2s_mode: primary
+    correct_dc_offset: true
+
+  # What micro_wake_word and voice_assistant hear: one mic, 16 kHz, 16 bit, with gain.
+  - platform: resampler
+    id: mic_16k
+    microphone:
+      microphone: i2s_mics
+      channels: ${mic_channel}
+      gain_factor: ${mic_gain}
+      bits_per_sample: 16
+    sample_rate: 16000
 
 speaker:
   - platform: i2s_audio
     id: onju_out
-    sample_rate: 48000
-    #bits_per_sample: 24bit
-    i2s_mode: primary
+    i2s_audio_id: i2s_bus
     i2s_dout_pin: GPIO12
-    i2s_audio_id: i2s_output
     dac_type: external
+    sample_rate: 48000
+    bits_per_sample: 32bit
     channel: stereo
-    timeout: 500ms
+    i2s_mode: primary
     buffer_duration: 100ms
+    # On the full duplex bus the TX data arrives one bit late at the amp when using stand_i2s: its sign bit
+    # becomes the previous sample's LSB, so any software volume < 100% turns into loud noise.
+    # stand_msb (no 1-bit delay) realigns it. Verified on nabu2 2026-11-20 (ESPHome 2026.11.0).
+    i2s_comm_fmt: stand_msb
   - platform: mixer
     id: mixer_speaker_id
     output_speaker: onju_out
+    num_channels: 2
+    task_stack_in_psram: true
     source_speakers:
       - id: announcement_spk_mixer_input
         timeout: 200ms
@@ -159,28 +165,13 @@ speaker:
   - platform: resampler
     id: media_spk_resampling_input
     output_speaker: media_spk_mixer_input
+    sample_rate: 48000
+    bits_per_sample: 32
   - platform: resampler
     id: announcement_spk_resampling_input
     output_speaker: announcement_spk_mixer_input
-
-microphone:
-  - platform: i2s_audio
-    id: i2s_mics
-    i2s_din_pin: GPIO17
-    adc_type: external
-    #use_apll: true
-    pdm: false
-    sample_rate: 16000
-    bits_per_sample: 32bit
-    i2s_mode: primary
-    i2s_audio_id: i2s_input
-    channel: stereo
-    # channel_0: # e.g. left mic
-    #   id: onju_microphone
-    #   amplify_shift: 2 # this was important
-    # channel_1: # e.g. right mic
-    #   id: mww_microphone
-    #   amplify_shift: 2 # this was important
+    sample_rate: 48000
+    bits_per_sample: 32
 
 media_player:
   - platform: speaker
@@ -197,52 +188,43 @@ media_player:
         file: beep.flac
       - id: error
         file: error24.flac
-      # - id: timer_finished
-      #   file: timer_finished.flac
-      # ffmpeg -i error.flac -af aresample=out_sample_fmt=s16:out_sample_rate=24000 error24.flac
-    on_state:
-      then:
-        - lambda: |-
-            static float old_volume = -1;
-            float new_volume = id(nabu).volume;
-            if(abs(new_volume-old_volume) > 0.0001) {
-              if(old_volume != -1) {
-                id(show_volume)->execute();
-              }
-            }
-            old_volume = new_volume;
-    on_announcement:
-      - logger.log: "On Announce"
-      - delay: 250ms
-      - microphone.stop_capture:
-    on_play:
-      #- logger.log: "On Play"
-      - delay: 250ms
-      - microphone.stop_capture:
-    on_pause:
-      #- logger.log: "On Pause"
-      - microphone.stop_capture:
-      - wait_until:
-          not:
-            speaker.is_playing:
-              id: onju_out
-      - microphone.capture:
-    on_idle:
-      #- logger.log: "On IDLE"
-      - microphone.stop_capture:
-      - wait_until:
-          not:
-            speaker.is_playing:
-              id: onju_out
-      - microphone.capture:
+    on_volume:
+      - script.execute: show_volume
+
+micro_wake_word:
+  id: mww
+  models:
+    - model: okay_nabu
+  microphone: mic_16k
+  stop_after_detection: false
+  vad:
+  on_wake_word_detected:
+    - mixer_speaker.apply_ducking:
+        id: media_spk_mixer_input
+        decibel_reduction: ${duck_db}
+        duration: 0.0s
+    - media_player.speaker.play_on_device_media_file:
+        media_file: wakeup
+        announcement: true
+    - wait_until:
+        condition:
+          media_player.is_announcing: nabu
+        timeout: 500ms
+    - wait_until:
+        not:
+          media_player.is_announcing: nabu
+    - voice_assistant.start:
+        wake_word: !lambda return wake_word;
 
 voice_assistant:
   id: va
-  microphone:
-    microphone: i2s_mics # onju_microphone
-    channels: 1
-  media_player:
+  microphone: mic_16k
+  media_player: nabu
+  micro_wake_word: mww
   use_wake_word: false
+  noise_suppression_level: ${noise_suppression_level}
+  auto_gain: ${auto_gain}
+  volume_multiplier: ${volume_multiplier}
   on_listening:
     - light.turn_on:
         id: top_led
@@ -252,7 +234,6 @@ voice_assistant:
         brightness: 100%
         effect: listening
   on_stt_vad_end:
-    - delay: 200ms
     - light.turn_on:
         id: top_led
         blue: 100%
@@ -267,22 +248,21 @@ voice_assistant:
         red: 20%
         green: 100%
         effect: speaking
-  on_idle:
-    - logger.log: "voice assist idle"
   on_end:
-    - logger.log: "calling on end"
-    - delay: 5s
     - wait_until:
         not:
-          speaker.is_playing:
-            id: announcement_spk_mixer_input
+          media_player.is_announcing: nabu
+    - mixer_speaker.apply_ducking:
+        id: media_spk_mixer_input
+        decibel_reduction: 0
+        duration: 1.0s
     - script.execute: reset_led
-    - logger.log: "Really on end now"
     - if:
         condition:
           and:
             - switch.is_on: use_wake_word
             - binary_sensor.is_off: mute_switch
+            - not: micro_wake_word.is_running
         then:
           - micro_wake_word.start:
   on_client_connected:
@@ -294,16 +274,9 @@ voice_assistant:
         then:
           - micro_wake_word.start:
   on_client_disconnected:
-    - if:
-        condition:
-          and:
-            - switch.is_on: use_wake_word
-            - binary_sensor.is_off: mute_switch
-        then:
-          - voice_assistant.stop:
-          - micro_wake_word.stop:
+    - voice_assistant.stop:
+    - micro_wake_word.stop:
   on_error:
-    #- media_player.play_media: "${error_sound_url}"
     - media_player.speaker.play_on_device_media_file:
         media_file: error
         announcement: true
@@ -321,9 +294,6 @@ voice_assistant:
         effect: random_twinkle
   on_timer_finished:
     - media_player.play_media: "${timer_finished_sound_url}"
-    # - media_player.speaker.play_on_device_media_file:
-    #     media_file: timer_finished
-    #     announcement: true
     - light.turn_on:
         id: top_led
         blue: 0%
@@ -333,33 +303,30 @@ voice_assistant:
     - delay: 5s
     - script.execute: reset_led
 
+# ---------------------------------------------------------------- touch
+
 esp32_touch:
-  setup_mode: false
+  setup_mode: ${touch_setup_mode}
+  # Explicit timing; the driver defaults saturate the pads (value 4194303).
   sleep_duration: 2ms
   measurement_duration: 800us
   low_voltage_reference: 0.8V
   high_voltage_reference: 2.4V
-
   filter_mode: IIR_16
   debounce_count: 2
   noise_threshold: 0
   jitter_step: 0
   smooth_mode: IIR_2
-
   denoise_grade: BIT8
   denoise_cap_level: L0
 
 binary_sensor:
   - platform: esp32_touch
     id: volume_down
+    name: "Touch volume down"
+    internal: true
     pin: GPIO4
-    threshold:
-      mode: dynamic
-      initial_value: 539000
-      lookback_num_values: 10
-      scan_interval: 1s
-      max_deviation: 0.5%
-      max_consecutive_anomalies: 10
+    threshold: ${touch_thresh_left}
     on_press:
       then:
         - light.turn_on: left_led
@@ -381,14 +348,10 @@ binary_sensor:
 
   - platform: esp32_touch
     id: volume_up
+    name: "Touch volume up"
+    internal: true
     pin: GPIO2
-    threshold:
-      mode: dynamic
-      initial_value: 580000
-      lookback_num_values: 10
-      scan_interval: 1s
-      max_deviation: 0.5%
-      max_consecutive_anomalies: 10
+    threshold: ${touch_thresh_right}
     on_press:
       then:
         - light.turn_on: right_led
@@ -410,14 +373,10 @@ binary_sensor:
 
   - platform: esp32_touch
     id: action
+    name: "Touch center"
+    internal: true
     pin: GPIO3
-    threshold:
-      mode: dynamic
-      initial_value: 751000
-      lookback_num_values: 10
-      scan_interval: 1s
-      max_deviation: 0.5%
-      max_consecutive_anomalies: 10
+    threshold: ${touch_thresh_center}
 
   - platform: gpio
     id: mute_switch
@@ -430,13 +389,15 @@ binary_sensor:
     on_release:
       - script.execute: turn_on_wake_word
 
+# ---------------------------------------------------------------- leds
+
 light:
   - platform: esp32_rmt_led_strip
     id: leds
     pin: GPIO11
     chipset: SK6812
     num_leds: 6
-    rgb_order: grb
+    channel_colors: GRB
     default_transition_length: 0s
     gamma_correct: 2.8
   - platform: partition
@@ -474,6 +435,8 @@ light:
       - addressable_flicker:
           name: speaking
           intensity: 35%
+      - addressable_random_twinkle:
+          name: random_twinkle
       - addressable_lambda:
           name: show_volume
           update_interval: 50ms
@@ -509,19 +472,6 @@ script:
           id: nabu
           volume: !lambda return clamp(id(nabu).volume+volume, 0.0f, 1.0f);
 
-  - id: control_led_volume_touched
-    mode: restart
-    then:
-      - if:
-          condition:
-            lambda: "return id(volume_touched);"
-          then:
-            - light.turn_on:
-                id: top_led
-                effect: show_volume
-            - delay: 1s
-            - lambda: |
-                id(volume_touched) = false;
   - id: reset_led
     then:
       - if:
@@ -551,6 +501,7 @@ script:
                       effect: listening_ww
                 else:
                   - light.turn_off: top_led
+
   - id: show_volume
     mode: restart
     then:
@@ -559,6 +510,7 @@ script:
           effect: show_volume
       - delay: 1s
       - script.execute: reset_led
+
   - id: turn_on_notification
     then:
       - lambda: id(notification) = true;
@@ -578,13 +530,6 @@ script:
               - switch.is_on: use_wake_word
           then:
             - micro_wake_word.start
-            - if:
-                condition:
-                  speaker.is_playing:
-                    id: onju_out
-                then:
-                  - speaker.stop:
-                      id: onju_out
             - script.execute: reset_led
           else:
             - logger.log:
@@ -617,7 +562,3 @@ switch:
     pin:
       number: GPIO21
       inverted: True
-
-external_components:
-  - source: github://pr#7802 # Self calibration for ESP32 touch controls https://github.com/esphome/esphome/pull/7802
-    components: [esp32_touch]

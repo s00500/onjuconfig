@@ -1,0 +1,120 @@
+# Mic debug add-on for nabu_duplex.yml: streams microphone audio over UDP to a PC.
+# Receiver: tools/nabu_mic_rx.py (writes WAVs and prints per-second levels per channel).
+#
+# Two switches in HA / the web UI:
+#   "Mic debug raw"  -> i2s_mics as captured: 48 kHz, 32 bit, stereo (both mics). ~3 Mbit/s.
+#   "Mic debug 16k"  -> mic_16k, exactly what micro_wake_word and voice_assistant get. ~256 kbit/s.
+#
+# Packet: 16 byte header + PCM
+#   0..1 "NB" | 2 stream (0 raw, 1 16k) | 3 bits per sample | 4 channels | 5..7 zero
+#   8..11 sample rate (u32 LE) | 12..15 sequence (u32 LE, per stream)
+#
+# Device config:
+#   substitutions:
+#     micdebug_host: "192.168.0.x"   # the PC running nabu_mic_rx.py
+#   packages:
+#     onju: !include onjuconfig/nabu_duplex.yml
+#     micdebug: !include onjuconfig/nabu_micdebug.yml
+
+substitutions:
+  micdebug_port: "41234"
+
+# For toggling the switches when the device is not in Home Assistant:
+#   curl -X POST -H 'Content-Length: 0' 'http://<ip>/switch/Mic%20debug%20raw/turn_on'
+#   (web_server v3 uses the entity name in the URL)
+web_server:
+  port: 80
+  version: 3
+
+udp:
+  - id: micdebug_udp
+    port:
+      listen_port: 41235
+      broadcast_port: ${micdebug_port}
+    addresses:
+      - ${micdebug_host}
+
+globals:
+  - id: micdebug_seq_raw
+    type: uint32_t
+    initial_value: "0"
+  - id: micdebug_seq_16k
+    type: uint32_t
+    initial_value: "0"
+
+microphone:
+  - id: !extend i2s_mics
+    on_data:
+      - lambda: |-
+          if (!id(micdebug_raw).state) return;
+          static uint8_t pkt[16 + 1408];  // 1408 = 44 stereo 32-bit frames
+          const uint32_t rate = 48000;
+          for (size_t off = 0; off < x.size(); off += 1408) {
+            size_t n = std::min<size_t>(1408, x.size() - off);
+            uint32_t seq = id(micdebug_seq_raw)++;
+            pkt[0] = 'N'; pkt[1] = 'B'; pkt[2] = 0; pkt[3] = 32; pkt[4] = 2;
+            pkt[5] = pkt[6] = pkt[7] = 0;
+            memcpy(pkt + 8, &rate, 4);
+            memcpy(pkt + 12, &seq, 4);
+            memcpy(pkt + 16, x.data() + off, n);
+            id(micdebug_udp).send_packet(pkt, 16 + n);
+          }
+  - id: !extend mic_16k
+    on_data:
+      - lambda: |-
+          if (!id(micdebug_16k).state) return;
+          static uint8_t pkt[16 + 1024];
+          const uint32_t rate = 16000;
+          for (size_t off = 0; off < x.size(); off += 1024) {
+            size_t n = std::min<size_t>(1024, x.size() - off);
+            uint32_t seq = id(micdebug_seq_16k)++;
+            pkt[0] = 'N'; pkt[1] = 'B'; pkt[2] = 1; pkt[3] = 16; pkt[4] = 1;
+            pkt[5] = pkt[6] = pkt[7] = 0;
+            memcpy(pkt + 8, &rate, 4);
+            memcpy(pkt + 12, &seq, 4);
+            memcpy(pkt + 16, x.data() + off, n);
+            id(micdebug_udp).send_packet(pkt, 16 + n);
+          }
+
+switch:
+  - platform: template
+    name: "Mic debug raw"
+    id: micdebug_raw
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    entity_category: diagnostic
+    on_turn_on:
+      # udp.write in the config is also what makes the udp component open its send socket
+      - udp.write:
+          id: micdebug_udp
+          data: "micdebug raw on"
+      - microphone.capture: i2s_mics
+  - platform: template
+    name: "Mic debug 16k"
+    id: micdebug_16k
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    entity_category: diagnostic
+    on_turn_on:
+      # udp.write in the config is also what makes the udp component open its send socket
+      - udp.write:
+          id: micdebug_udp
+          data: "micdebug 16k on"
+      - microphone.capture: mic_16k
+
+# Volume probe: while the I2S speaker runs, log the volume it received and the gain its ramp actually applies.
+interval:
+  - interval: 500ms
+    then:
+      - lambda: |-
+          if (!id(onju_out).is_running()) return;
+          struct Peek : i2s_audio::I2SAudioSpeakerBase {
+            static int32_t q31(i2s_audio::I2SAudioSpeakerBase *s) {
+              auto ptr = &Peek::gain_ramp_;  // member pointer typed on the base, legal via the derived class
+              return (s->*ptr).current_q31();
+            }
+          };
+          const int32_t q = Peek::q31(id(onju_out));
+          const float db = q > 0 ? 20.0f * log10f((float) q / 2147483648.0f) : -999.0f;
+          ESP_LOGD("volprobe", "spk volume %.2f (mp %.2f) applied gain %.1f dB (q31 %ld)",
+                   id(onju_out).get_volume(), id(nabu).volume, db, (long) q);
