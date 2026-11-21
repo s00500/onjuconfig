@@ -21,7 +21,9 @@ substitutions:
   touch_thresh_center: "12000"
   touch_thresh_right: "7000"
   wakeup_sound_file: https://github.com/s00500/onjuconfig/raw/master/sounds/beep.flac
+  # Voice PE wake sound: https://github.com/esphome/home-assistant-voice-pe/raw/e2fc10e81071d1f2b7e7674af730c15b8819123f/sounds/wake_word_triggered.flac
   error_sound_file: https://github.com/s00500/onjuconfig/raw/master/sounds/error24.flac
+  # Voice PE has no error sound (LEDs only)
   timer_finished_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/e2fc10e81071d1f2b7e7674af730c15b8819123f/sounds/timer_finished.flac
 
 esphome:
