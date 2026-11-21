@@ -21,4 +21,4 @@ packages:
   # micdebug: github://s00500/onjuconfig/nabu_micdebug.yml@<commit>
 ```
 
-Also needs `wifi_ssid` / `wifi_password` secrets and `beep.flac` / `error24.flac` next to the device config. Tunables (mic gain, touch thresholds, ducking) are the substitutions at the top of `nabu_duplex.yml`.
+Also needs `wifi_ssid` / `wifi_password` secrets. The wake and error sounds live in `sounds/` and are fetched from this repo; override `wakeup_sound_file` / `error_sound_file` with a local path or another URL to use your own. Tunables (mic gain, touch thresholds, ducking) are the substitutions at the top of `nabu_duplex.yml`.

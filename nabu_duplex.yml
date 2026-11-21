@@ -20,6 +20,8 @@ substitutions:
   touch_thresh_left: "8000"
   touch_thresh_center: "12000"
   touch_thresh_right: "7000"
+  wakeup_sound_file: https://github.com/s00500/onjuconfig/raw/master/sounds/beep.flac
+  error_sound_file: https://github.com/s00500/onjuconfig/raw/master/sounds/error24.flac
   timer_finished_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/e2fc10e81071d1f2b7e7674af730c15b8819123f/sounds/timer_finished.flac
 
 esphome:
@@ -189,9 +191,9 @@ media_player:
       num_channels: 2
     files:
       - id: wakeup
-        file: beep.flac
+        file: ${wakeup_sound_file}
       - id: error
-        file: error24.flac
+        file: ${error_sound_file}
       - id: timer_finished
         file: ${timer_finished_sound_file}
     on_volume:
