@@ -21,4 +21,4 @@ packages:
   # micdebug: github://s00500/onjuconfig/nabu_micdebug.yml@<commit>
 ```
 
-Also needs `wifi_ssid` / `wifi_password` secrets. The wake and error sounds live in `sounds/` and are fetched from this repo; override `wakeup_sound_file` / `error_sound_file` with a local path or another URL to use your own. Tunables (mic gain, touch thresholds, ducking) are the substitutions at the top of `nabu_duplex.yml`.
+Also needs `wifi_ssid` / `wifi_password` secrets. The wake and error sounds live in `sounds/` and are fetched from this repo; override `wakeup_sound_file` / `error_sound_file` with a local path or another URL to use your own. `mute_on.flac` / `mute_off.flac` are the Voice PE `mute_switch_on` / `mute_switch_off` sounds from [esphome/home-assistant-voice-pe](https://github.com/esphome/home-assistant-voice-pe/tree/dev/sounds), trimmed to 0.6 / 0.8 s at 24 kHz to save flash. Tunables (mic gain, touch thresholds, ducking) are the substitutions at the top of `nabu_duplex.yml`.

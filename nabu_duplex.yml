@@ -7,14 +7,26 @@
 # - Touch thresholds are deltas to the hardware benchmark. Calibrate with touch_setup_mode: "true".
 # - Timers ring like on the Voice PE: built-in sound repeated as an announcement over ducked media until
 #   stopped by saying "stop", the wake word or the center pad (max 15 min). The top LEDs count down.
+# - Assist starts wake_listen_delay after the wake sound starts (not after it ended), so the first word
+#   is not lost. Music is almost muted while you speak (duck_listen_db) and duck_db quieter during the
+#   reply and Home Assistant announcements. LEDs and ducking wait for the TTS reply to finish playing.
+# - Center pad: tap = stop timer / stop announcement / stop Assist / play-pause / start Assist,
+#   double, triple and long press are sent to HA as events.
+# - Media player is speaker_source with Sendspin, so Music Assistant streams natively (also in sync groups).
+#   The firmware (~2.0 MB) needs the 16MB partition layout, see flash_size below.
+# - Several ideas taken from https://github.com/rmeissn/onju-voice-esphome (core components only here).
 
 substitutions:
   mic_channel: "1" # 0 = left slot, 1 = right slot
   mic_gain: "8" # integer 1..64, applied at 32 bit before conversion to 16 bit (8: speech peaks ~ -11 dBFS on nabu 2)
-  noise_suppression_level: "0" # 0..4, done by Home Assistant
-  auto_gain: "0dBFS" # 0..31 dBFS, done by Home Assistant
-  volume_multiplier: "1.0" # done by Home Assistant
-  duck_db: "20"
+  # Requested from the HA pipeline, but HA up to 2026.11.1 ignores them (forwarded since core PR #190096)
+  noise_suppression_level: "0" # 0..4
+  auto_gain: "0dBFS" # 0..31 dBFS
+  volume_multiplier: "1.0"
+  duck_db: "20" # music during replies, announcements and ringing timers
+  duck_listen_db: "255" # music while Assist listens (255 = practically off, no echo cancellation here)
+  # From the start of the wake sound to voice_assistant.start. beep.flac (463 ms) is -20 dB at 300 ms.
+  wake_listen_delay: 300ms
   touch_setup_mode: "false"
   # nabu 2, 2026-11-19: idle noise up to ~3k, touched +18..22k (left), +11..21k (right), +30..37k (center)
   touch_thresh_left: "8000"
@@ -25,6 +37,9 @@ substitutions:
   error_sound_file: https://github.com/s00500/onjuconfig/raw/master/sounds/error24.flac
   # Voice PE has no error sound (LEDs only)
   timer_finished_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/e2fc10e81071d1f2b7e7674af730c15b8819123f/sounds/timer_finished.flac
+  # Voice PE mute_switch_on/off.flac, trimmed to 0.6 / 0.8 s at 24 kHz (57 kB instead of 115 kB of flash)
+  mute_sound_file: https://github.com/s00500/onjuconfig/raw/master/sounds/mute_on.flac
+  unmute_sound_file: https://github.com/s00500/onjuconfig/raw/master/sounds/mute_off.flac
 
 esphome:
   name: "${name}"
@@ -62,23 +77,37 @@ esphome:
           green: 100%
           blue: 0%
       - delay: 1s
+      - lambda: id(booted) = true;
       - script.execute: reset_led
 
 esp32:
   board: esp32-s3-devkitc-1
   cpu_frequency: 240MHz
   variant: esp32s3
+  # 16MB layout (app slots 0x7C0000). Units still on the old 4MB layout (app slots 0x1C0000, see
+  # "Partition table:" in the log) need one USB flash first: OTA never changes the partition table.
+  flash_size: 16MB
   framework:
     type: esp-idf
+    advanced:
+      # Code and read only data are copied to PSRAM at boot and run from there (as on the Voice PE):
+      # faster than flash, speeds up micro_wake_word, and flash writes no longer stall the CPU.
+      execute_from_psram: true
     sdkconfig_options:
       CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
       CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
       CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      # WiFi code out of IRAM: ~23 kB more internal RAM, slightly lower peak WiFi throughput
+      # (no music stutter in rmeissn's measurements). Remove these three if streams start to stutter.
+      CONFIG_ESP_WIFI_IRAM_OPT: "n"
+      CONFIG_ESP_WIFI_RX_IRAM_OPT: "n"
+      CONFIG_ESP_WIFI_EXTRA_IRAM_OPT: "n"
 
 psram:
   mode: octal
   speed: 80MHz
+  ignore_not_found: false # the Onju always has 8MB octal PSRAM; lets ESPHome move more buffers (e.g. NVS cache) there
 
 logger:
 
@@ -112,6 +141,64 @@ globals:
   - id: notification
     type: bool
     restore_value: false
+  - id: booted
+    type: bool
+    restore_value: false
+  - id: conn_error
+    type: bool
+    restore_value: false
+  - id: wifi_error_count
+    type: int
+    restore_value: false
+  - id: api_error_count
+    type: int
+    restore_value: false
+  # Media player volume before a ringing timer changed it (-1 = not changed)
+  - id: volume_before_timer
+    type: float
+    restore_value: false
+    initial_value: "-1.0"
+  # No volume LEDs until this millis() value (volume changes made by the timer itself)
+  - id: volume_led_quiet_until
+    type: uint32_t
+    restore_value: false
+  # The center pad press already stopped a ringing timer, ignore the click that follows
+  - id: center_press_used
+    type: bool
+    restore_value: false
+
+# Connection error LED: WiFi lost > 10 s or HA API lost > 30 s
+interval:
+  - interval: 2s
+    then:
+      - if:
+          condition:
+            lambda: return id(booted);
+          then:
+            - if:
+                condition:
+                  wifi.connected:
+                then:
+                  - lambda: id(wifi_error_count) = 0;
+                else:
+                  - lambda: id(wifi_error_count) += 1;
+            - if:
+                condition:
+                  api.connected:
+                then:
+                  - lambda: id(api_error_count) = 0;
+                else:
+                  - lambda: id(api_error_count) += 1;
+            - if:
+                condition:
+                  lambda: return (id(wifi_error_count) >= 5 || id(api_error_count) >= 15) != id(conn_error);
+                then:
+                  - lambda: id(conn_error) = !id(conn_error);
+                  - logger.log:
+                      level: WARN
+                      format: "Connection error: %s (WiFi errors %d, API errors %d)"
+                      args: ['id(conn_error) ? "yes" : "recovered"', "id(wifi_error_count)", "id(api_error_count)"]
+                  - script.execute: reset_led
 
 # ---------------------------------------------------------------- audio
 
@@ -181,25 +268,96 @@ speaker:
     sample_rate: 48000
     bits_per_sample: 32
 
+# Sendspin: Music Assistant (2.10.7+) streams to the device natively, also synchronized in groups
+sendspin:
+  id: sendspin_hub
+
+# On-device sounds, played with media_url "audio-file://<id>"
+audio_file:
+  - id: wakeup
+    file: ${wakeup_sound_file}
+  - id: error
+    file: ${error_sound_file}
+  - id: timer_finished
+    file: ${timer_finished_sound_file}
+  - id: mute_on
+    file: ${mute_sound_file}
+  - id: mute_off
+    file: ${unmute_sound_file}
+
+media_source:
+  - platform: audio_file
+    id: file_announcement_source
+    task_stack_in_psram: true
+  - platform: audio_http # TTS replies and HA announcements
+    id: http_announcement_source
+    task_stack_in_psram: true
+  - platform: audio_http # media from HA / URLs
+    id: http_media_source
+    task_stack_in_psram: true
+  - platform: sendspin
+    id: sendspin_media_source
+    task_stack_in_psram: true
+
 media_player:
-  - platform: speaker
+  - platform: speaker_source
     name: "Media Player"
     id: nabu
-    media_pipeline:
-      speaker: media_spk_resampling_input
-      num_channels: 2
     announcement_pipeline:
       speaker: announcement_spk_resampling_input
+      format: FLAC
       num_channels: 2
-    files:
-      - id: wakeup
-        file: ${wakeup_sound_file}
-      - id: error
-        file: ${error_sound_file}
-      - id: timer_finished
-        file: ${timer_finished_sound_file}
+      sample_rate: 48000
+      sources:
+        - file_announcement_source
+        - http_announcement_source
+    media_pipeline:
+      speaker: media_spk_resampling_input
+      format: FLAC
+      num_channels: 2
+      sample_rate: 48000
+      sources:
+        - http_media_source
+        - sendspin_media_source
     on_volume:
-      - script.execute: show_volume
+      # Touch pads always show the volume, changes from HA / Music Assistant only if enabled
+      - if:
+          condition:
+            lambda: |-
+              if (millis() < id(volume_led_quiet_until) || id(timer_ringing).state) return false;
+              return id(volume_up).state || id(volume_down).state || id(show_remote_volume).state;
+          then:
+            - script.execute: show_volume
+    # Announcements from HA (tts.speak, assist_satellite.announce, ...): music only quieter.
+    # Assist and ringing timers do their own ducking.
+    on_announcement:
+      - if:
+          condition:
+            and:
+              - not: voice_assistant.is_running
+              - switch.is_off: timer_ringing
+              - not:
+                  script.is_running: start_assist
+          then:
+            - mixer_speaker.apply_ducking:
+                id: media_spk_mixer_input
+                decibel_reduction: ${duck_db}
+                duration: 0.0s
+    on_state:
+      - if:
+          condition:
+            and:
+              - not:
+                  media_player.is_announcing: nabu
+              - not: voice_assistant.is_running
+              - switch.is_off: timer_ringing
+              - not:
+                  script.is_running: start_assist
+          then:
+            - mixer_speaker.apply_ducking:
+                id: media_spk_mixer_input
+                decibel_reduction: 0
+                duration: 1.0s
 
 micro_wake_word:
   id: mww
@@ -221,21 +379,8 @@ micro_wake_word:
           # "stop" or the wake word while a timer rings only silences it
           - switch.turn_off: timer_ringing
         else:
-          - mixer_speaker.apply_ducking:
-              id: media_spk_mixer_input
-              decibel_reduction: ${duck_db}
-              duration: 0.0s
-          - media_player.speaker.play_on_device_media_file:
-              media_file: wakeup
-              announcement: true
-          - wait_until:
-              condition:
-                media_player.is_announcing: nabu
-              timeout: 500ms
-          - wait_until:
-              not:
-                media_player.is_announcing: nabu
-          - voice_assistant.start:
+          - script.execute:
+              id: start_assist
               wake_word: !lambda return wake_word;
 
 voice_assistant:
@@ -247,6 +392,13 @@ voice_assistant:
   noise_suppression_level: ${noise_suppression_level}
   auto_gain: ${auto_gain}
   volume_multiplier: ${volume_multiplier}
+  # Ducking: music practically off while the mic records speech, duck_db quieter during
+  # thinking and reply, back to normal in on_end (unless a timer rings)
+  on_start:
+    - mixer_speaker.apply_ducking:
+        id: media_spk_mixer_input
+        decibel_reduction: ${duck_listen_db}
+        duration: 0.0s
   on_listening:
     - light.turn_on:
         id: top_led
@@ -263,17 +415,32 @@ voice_assistant:
         green: 20%
         brightness: 70%
         effect: processing
+    - mixer_speaker.apply_ducking:
+        id: media_spk_mixer_input
+        decibel_reduction: ${duck_db}
+        duration: 0.5s
+  # A streamed reply starts playing with intent progress (x = TTS URL); on_tts_end is the fallback
+  on_intent_progress:
+    - if:
+        condition:
+          lambda: return !x.empty();
+        then:
+          - script.execute: reply_started
   on_tts_end:
-    - light.turn_on:
-        id: top_led
-        blue: 0%
-        red: 20%
-        green: 100%
-        effect: speaking
+    - script.execute: reply_started
+  # on_end fires when HA ends the pipeline, before the TTS reply has played. The voice assistant stays
+  # running (streaming response) until the reply was decoded, and the announcement resampler keeps
+  # playing until the last frame left the mixer.
   on_end:
     - wait_until:
-        not:
-          media_player.is_announcing: nabu
+        condition:
+          not: voice_assistant.is_running
+        timeout: 60s
+    - wait_until:
+        condition:
+          not:
+            speaker.is_playing: announcement_spk_resampling_input
+        timeout: 5s
     - if:
         condition:
           switch.is_off: timer_ringing
@@ -303,8 +470,9 @@ voice_assistant:
     - voice_assistant.stop:
     - micro_wake_word.stop:
   on_error:
-    - media_player.speaker.play_on_device_media_file:
-        media_file: error
+    - media_player.play_media:
+        id: nabu
+        media_url: "audio-file://error"
         announcement: true
     - light.turn_on:
         id: top_led
@@ -395,12 +563,56 @@ binary_sensor:
     internal: true
     pin: GPIO3
     threshold: ${touch_thresh_center}
+    # A ringing timer stops right on touch, everything else waits for the click pattern
     on_press:
+      - lambda: id(center_press_used) = false;
       - if:
           condition:
             switch.is_on: timer_ringing
           then:
+            - lambda: id(center_press_used) = true;
             - switch.turn_off: timer_ringing
+    on_multi_click:
+      - timing: # single tap
+          - ON for at most 1s
+          - OFF for at least 0.5s
+        then:
+          - if:
+              condition:
+                lambda: return !id(center_press_used);
+              then:
+                - script.execute: center_tap
+      - timing: # double tap
+          - ON for at most 0.5s
+          - OFF for at most 0.5s
+          - ON for at most 0.5s
+          - OFF for at least 0.25s
+        then:
+          - event.trigger:
+              id: button_press_event
+              event_type: double_press
+      - timing: # triple tap
+          - ON for at most 0.5s
+          - OFF for at most 0.5s
+          - ON for at most 0.5s
+          - OFF for at most 0.5s
+          - ON for at most 0.5s
+          - OFF for at least 0.25s
+        then:
+          - event.trigger:
+              id: button_press_event
+              event_type: triple_press
+      - timing: # long press
+          - ON for 1s to 3s
+          - OFF for at least 0.25s
+        then:
+          - if:
+              condition:
+                lambda: return !id(center_press_used);
+              then:
+                - event.trigger:
+                    id: button_press_event
+                    event_type: long_press
 
   - platform: gpio
     id: mute_switch
@@ -409,8 +621,16 @@ binary_sensor:
       mode: INPUT_PULLUP
     name: Disable wake word
     on_press:
+      - media_player.play_media:
+          id: nabu
+          media_url: "audio-file://mute_on"
+          announcement: true
       - script.execute: turn_off_wake_word
     on_release:
+      - media_player.play_media:
+          id: nabu
+          media_url: "audio-file://mute_off"
+          announcement: true
       - script.execute: turn_on_wake_word
 
 # ---------------------------------------------------------------- leds
@@ -506,6 +726,93 @@ light:
     default_transition_length: 100ms
 
 script:
+  # Wake word or center pad: duck, wake sound, Assist
+  - id: start_assist
+    mode: single
+    parameters:
+      wake_word: string
+    then:
+      # Duck now, not in on_start: otherwise the buffered undimmed music reaches the STT
+      - mixer_speaker.apply_ducking:
+          id: media_spk_mixer_input
+          decibel_reduction: ${duck_listen_db}
+          duration: 0.2s
+      - media_player.play_media:
+          id: nabu
+          media_url: "audio-file://wakeup"
+          announcement: true
+      - wait_until:
+          condition:
+            speaker.is_playing: announcement_spk_resampling_input
+          timeout: 1s
+      # People start talking when they hear the end of the sound: listen from there on
+      - delay: ${wake_listen_delay}
+      - voice_assistant.start:
+          wake_word: !lambda return wake_word;
+      # Unduck if Assist did not start (e.g. API down), otherwise on_end does it
+      - wait_until:
+          condition:
+            voice_assistant.is_running:
+          timeout: 2s
+      - if:
+          condition:
+            and:
+              - not: voice_assistant.is_running
+              - switch.is_off: timer_ringing
+          then:
+            - mixer_speaker.apply_ducking:
+                id: media_spk_mixer_input
+                decibel_reduction: 0
+                duration: 1.0s
+
+  - id: reply_started
+    then:
+      - mixer_speaker.apply_ducking:
+          id: media_spk_mixer_input
+          decibel_reduction: ${duck_db}
+          duration: 0.5s
+      - light.turn_on:
+          id: top_led
+          blue: 0%
+          red: 20%
+          green: 100%
+          effect: speaking
+
+  # Single tap on the center pad (a ringing timer is already handled in on_press)
+  - id: center_tap
+    then:
+      - if:
+          condition:
+            media_player.is_announcing: nabu
+          then:
+            - media_player.stop:
+                id: nabu
+                announcement: true
+          else:
+            - if:
+                condition:
+                  voice_assistant.is_running:
+                then:
+                  - voice_assistant.stop:
+                else:
+                  - if:
+                      condition:
+                        or:
+                          - media_player.is_playing: nabu
+                          - media_player.is_paused: nabu
+                      then:
+                        - media_player.toggle: nabu
+                      else:
+                        - if:
+                            condition:
+                              and:
+                                - binary_sensor.is_off: mute_switch
+                                - api.connected:
+                            then:
+                              - script.execute:
+                                  id: start_assist
+                                  wake_word: ""
+
   - id: set_volume
     mode: restart
     parameters:
@@ -529,7 +836,21 @@ script:
                 brightness: 100%
                 effect: pulse
           else:
-            - script.execute: reset_led_idle
+            - if:
+                condition:
+                  and:
+                    - lambda: return id(conn_error);
+                    - switch.is_on: connection_error_led
+                then:
+                  - light.turn_on:
+                      id: top_led
+                      red: 100%
+                      green: 0%
+                      blue: 0%
+                      brightness: 100%
+                      effect: pulse
+                else:
+                  - script.execute: reset_led_idle
 
   - id: reset_led_idle
     then:
@@ -647,13 +968,27 @@ switch:
           id: media_spk_mixer_input
           decibel_reduction: ${duck_db}
           duration: 0.0s
+      - if:
+          condition:
+            lambda: return id(timer_volume).state > 0;
+          then:
+            - lambda: |-
+                id(volume_before_timer) = id(nabu).volume;
+                id(volume_led_quiet_until) = millis() + 1000;
+            - media_player.volume_set:
+                id: nabu
+                volume: !lambda return id(timer_volume).state / 100.0f;
       - micro_wake_word.enable_model: stop
       - media_player.repeat_one:
           id: nabu
           announcement: true
-      - lambda: id(nabu).set_playlist_delay_ms(speaker::AudioPipelineType::ANNOUNCEMENT, 500);
-      - media_player.speaker.play_on_device_media_file:
-          media_file: timer_finished
+      - speaker_source.set_playlist_delay:
+          id: nabu
+          pipeline: announcement
+          delay: 500ms
+      - media_player.play_media:
+          id: nabu
+          media_url: "audio-file://timer_finished"
           announcement: true
       - script.execute: reset_led
       - script.execute: timer_ring_timeout
@@ -663,7 +998,10 @@ switch:
       - media_player.repeat_off:
           id: nabu
           announcement: true
-      - lambda: id(nabu).set_playlist_delay_ms(speaker::AudioPipelineType::ANNOUNCEMENT, 0);
+      - speaker_source.set_playlist_delay:
+          id: nabu
+          pipeline: announcement
+          delay: 0ms
       - if:
           condition:
             media_player.is_announcing: nabu
@@ -671,6 +1009,15 @@ switch:
             - media_player.stop:
                 id: nabu
                 announcement: true
+      - if:
+          condition:
+            lambda: return id(volume_before_timer) >= 0.0f;
+          then:
+            - lambda: id(volume_led_quiet_until) = millis() + 1000;
+            - media_player.volume_set:
+                id: nabu
+                volume: !lambda return id(volume_before_timer);
+            - lambda: id(volume_before_timer) = -1.0f;
       - if:
           condition:
             not: voice_assistant.is_running
@@ -686,3 +1033,114 @@ switch:
     pin:
       number: GPIO21
       inverted: True
+  # Volume LEDs also for volume changes from HA / Music Assistant (the touch pads always show them)
+  - platform: template
+    id: show_remote_volume
+    name: "Show remote volume changes"
+    icon: mdi:volume-vibrate
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+  - platform: template
+    id: connection_error_led
+    name: "Connection error LED"
+    icon: mdi:wifi-alert
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - script.execute: reset_led
+    on_turn_off:
+      - script.execute: reset_led
+
+# ---------------------------------------------------------------- settings
+
+select:
+  - platform: template
+    name: "Wake word sensitivity"
+    id: wake_word_sensitivity
+    icon: mdi:account-voice
+    optimistic: true
+    initial_option: Slightly sensitive
+    restore_value: true
+    entity_category: config
+    options:
+      - Slightly sensitive
+      - Moderately sensitive
+      - Very sensitive
+    on_value:
+      # Cutoffs as on the Voice PE (quantized uint8). Only for okay_nabu, extra models keep their own.
+      - lambda: |-
+          static const uint8_t cutoffs[] = {217, 176, 143};  // 0.85, 0.69, 0.56
+          if (i < 3) id(okay_nabu).set_probability_cutoff(cutoffs[i]);
+
+number:
+  - platform: template
+    name: "Timer volume"
+    id: timer_volume
+    icon: mdi:timer-music
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 0 # 0 = ring at the current volume
+    max_value: 100
+    step: 5
+    initial_value: 0
+    restore_value: true
+    optimistic: true
+    on_value:
+      - if:
+          condition:
+            and:
+              - switch.is_on: timer_ringing
+              - lambda: return x > 0;
+          then:
+            - lambda: |-
+                if (id(volume_before_timer) < 0.0f) id(volume_before_timer) = id(nabu).volume;
+                id(volume_led_quiet_until) = millis() + 1000;
+            - media_player.volume_set:
+                id: nabu
+                volume: !lambda return x / 100.0f;
+
+event:
+  # Center pad patterns for HA automations (the single tap controls the device itself)
+  - platform: template
+    id: button_press_event
+    name: "Button press"
+    icon: mdi:button-pointer
+    device_class: button
+    event_types:
+      - double_press
+      - triple_press
+      - long_press
+
+# ---------------------------------------------------------------- diagnostics
+
+debug:
+
+button:
+  - platform: restart
+    name: "Restart"
+    entity_category: config
+    disabled_by_default: true
+
+sensor:
+  - platform: wifi_signal
+    name: "WiFi signal"
+    update_interval: 60s
+    entity_category: diagnostic
+    disabled_by_default: true
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+    entity_category: diagnostic
+    disabled_by_default: true
+  - platform: debug
+    loop_time: # longest main loop iteration in the last 60 s, > ~30 ms = something blocks
+      name: "Loop time"
+      disabled_by_default: true
+
+text_sensor:
+  - platform: debug
+    reset_reason:
+      name: "Restart reason"
+      disabled_by_default: true
